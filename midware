@@ -1,0 +1,177 @@
+#!/bin/bash
+set -e
+
+usage() {
+    echo "Usage: $0 -b bridge [-i ipaddr/netmask] [-c container interface] -- <docker run uptions> [-- command]"
+    echo "-b             # Name of the host bridge"
+    echo "-i             # IP address of the interface in CIDR format"
+    echo "-c             # Name of the container interface"
+    echo "<command>      # Command to run in the container, defaults to /sbin/init"
+}
+
+BRIDGE=
+CONTAINER_IFNAME=eth1
+IPADDR=
+COMMAND=/sbin/init
+
+OPTIND=1
+while getopts ":hdb:c:i:m:v:" opt; do
+    case "$opt" in
+    b)
+        BRIDGE=$OPTARG
+        ;;
+    c)
+        CONTAINER_IFNAME=$OPTARG
+        ;;
+    i)
+        IPADDR=$OPTARG
+        ;;
+    *)
+        usage
+        exit 0
+        ;;
+    esac
+done
+
+shift $((OPTIND-1))
+
+[ "$*" ] && {
+    COMMAND=$*
+}
+
+[ "$BRIDGE" ] || {
+    echo "Please specify the host bridge to use"
+    exit 1
+}
+
+# If we are running on the host...
+if [ $(head -1 /proc/1/cgroup | cut -f3 -d:) = "/" ]; then
+  if ! which docker > /dev/null 2>&1; then
+    echo "Docker is missing"
+    exit 1
+  fi
+
+  # Add a reference to root network namespace if not already done
+  if ! mount | grep -q '/var/run/netns/root'; then
+    mkdir -p /var/run/netns
+    rm -rf /var/run/netns/root
+    touch /var/run/netns/root
+    mount -o bind /proc/self/ns/net /var/run/netns/root
+  fi
+
+  # Extract options to docker run
+  DOCKER_ARGS=$(echo "$COMMAND" | awk -F' -- ' '{print $1}')
+  IMAGE=$(echo "$DOCKER_ARGS" | awk '{print $NF}')
+
+  # Get Entrypoint and Cmd info from the image
+  ENTRYPOINT=$(docker inspect --format {{.ContainerConfig.Entrypoint}} $IMAGE)
+  CMD=$(docker inspect --format {{.ContainerConfig.Cmd}} $IMAGE)
+
+  # Trim the braces around the values
+  ENTRYPOINT=$(echo $ENTRYPOINT | cut -b 2-$((${#ENTRYPOINT} - 1)))
+  CMD=$(echo $CMD | cut -b 2-$((${#CMD} - 1)))
+
+  [ "$ENTRYPOINT" = "no value" ] && {
+    ENTRYPOINT=
+  }
+  [ "$CMD" = "no value" ] && {
+    CMD=
+  }
+
+  # Extract command on the command line and trim its whitespace
+  APP_ARGS=$(echo "$COMMAND" | awk -F' -- ' '{print $2}' | sed -e 's/^ *//' -e 's/ *$//')
+  # If no command passed, use Cmd from the image
+  [ "$APP_ARGS" ] || {
+    APP_ARGS="$CMD"
+  }
+
+  MIDWARE_ARGS="-b $BRIDGE"
+  [ "$IPADDR" ] && {
+    MIDWARE_ARGS=" $MIDWARE_ARGS -i $IPADDR"
+  }
+  [ "$CONTAINER_IFNAME" ] && {
+    MIDWARE_ARGS=" $MIDWARE_ARGS -c $CONTAINER_IFNAME"
+  }
+
+  # Get the location of the script to mount it in the container
+  DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+  BASE="$( basename "${BASH_SOURCE[0]}" )"
+
+  # Mount midware into the container, set it as the entrypoint and invoke it
+  docker run --privileged -v /var/run/netns/root:/var/run/netns/root -v $DIR/$BASE:/midware --entrypoint=/midware $DOCKER_ARGS $MIDWARE_ARGS $ENTRYPOINT $APP_ARGS
+  exit $?
+fi
+
+NETNS=$(ip netns 2>/dev/null) || {
+  echo "Either ip utility is missing or it doesn't support netns"
+  exit 1
+}
+
+echo $NETNS | grep -q root || {
+  echo "Root network namespace not mounted in the container"
+  exit 1
+}
+
+# We expect $BRIDGE to be a Linux bridge
+if ! ip netns exec root ls /sys/class/net/$BRIDGE/bridge > /dev/null 2>&1; then
+  echo "$BRIDGE is not a Linux bridge"
+  exit 1
+fi
+
+[ "$IPADDR" ] && {
+  echo $IPADDR | grep -q / || {
+    echo "Please specify the IP address in CIDR format with netmask (e.g., $IPADDR/24)"
+    exit 1
+  }
+}
+
+CONTAINER_NAME=`cut -c'1-5' /etc/hostname`
+HOST_IFNAME="veth${CONTAINER_NAME}${CONTAINER_IFNAME}"
+
+# Create a veth pair to connect the container to the bridge
+ip link add name $CONTAINER_IFNAME type veth peer name $HOST_IFNAME
+ip link set $CONTAINER_IFNAME up
+
+# Cleanup any stale interface with the same name before moving the host end
+# into root namespace
+ip netns exec root ip link delete $HOST_IFNAME > /dev/null 2>&1 || true
+ip link set $HOST_IFNAME netns root
+
+# Add host end of the veth pair into the bridge.  Try brctl if ip doesn't
+# support master.
+(ip netns exec root ip link set $HOST_IFNAME master $BRIDGE > /dev/null 2>&1) || {
+  if which brctl > /dev/null 2>&1; then
+    ip netns exec root brctl addif $BRIDGE $HOST_IFNAME
+  else
+    echo "brctl is missing; Please install bridge-utils"
+    exit 1
+  fi
+}
+ip netns exec root ip link set $HOST_IFNAME up
+
+# Configure the IP address if one is specified, otherwise leave it as a raw
+# interface
+[ $IPADDR ] && {
+  ip addr add $IPADDR dev $CONTAINER_IFNAME
+  ip link set $CONTAINER_IFNAME up
+
+  # Wait for the interface come up before sending ARP reply, otherwise it may
+  # get dropped
+  while ! grep -q ^1$ /sys/class/net/$CONTAINER_IFNAME/carrier 2>/dev/null; do
+    sleep 1
+  done
+
+  # Send a gratuituous ARP reply to advertize the MAC address of the new interface
+  if which arping > /dev/null 2>&1; then
+    IPADDR=$(echo $IPADDR | cut -d/ -f1)
+    arping -c 1 -A -I $CONTAINER_IFNAME $IPADDR > /dev/null 2>&1 || true
+  fi
+}
+
+[ "$COMMAND" = "/sbin/init" ] && {
+  exec $COMMAND
+}
+
+$*
+
+exit 0
