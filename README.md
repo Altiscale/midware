@@ -22,7 +22,7 @@ Midware OPTIONS include:
 
 ## Examples
 
-The following creates a Docker container with a preconfigured network interface named `eth0` bridged into an existing Linux bridge named `br0` on the host.  The new interface is assigned the specified IP address before the command runs.
+The following command creates a Docker container with a preconfigured network interface named `eth0` bridged into an existing Linux bridge named `br0` on the host.  The new interface is assigned the specified IP address (10.10.10.10/24) before the command runs.
 
 ```
 # midware -b br0 -i 10.10.10.10/24 -c eth0 -- -it --net=none ubuntu -- ip addr
@@ -45,3 +45,11 @@ The following command creates a container with a raw network interface eth1 with
 ```
 # midware -b br0 -- -d ubuntu
 ```
+
+## Preconditions
+
+The section lists midware's dependencies.
+
+* The docker host must be running the bridge specified with the `-b` option.
+* The docker host must be able to run the container with the `--privileged` option.
+* The docker container must have the bridge-utils package installed so that midware can run brctl.

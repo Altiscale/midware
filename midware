@@ -2,7 +2,7 @@
 set -e
 
 usage() {
-    echo "Usage: $0 -b bridge [-i ipaddr/netmask] [-c container interface] -- <docker run uptions> [-- command]"
+    echo "Usage: $0 -b bridge [-i ipaddr/netmask] [-c container interface] -- <docker run options> [-- command]"
     echo "-b             # Name of the host bridge"
     echo "-i             # IP address of the interface in CIDR format"
     echo "-c             # Name of the container interface"
@@ -102,6 +102,7 @@ if [ $(head -1 /proc/1/cgroup | cut -f3 -d:) = "/" ]; then
   exit $?
 fi
 
+# If we are running on the container...
 NETNS=$(ip netns 2>/dev/null) || {
   echo "Either ip utility is missing or it doesn't support netns"
   exit 1
@@ -172,6 +173,6 @@ ip netns exec root ip link set $HOST_IFNAME up
   exec $COMMAND
 }
 
-$*
+$COMMAND
 
 exit 0
